@@ -30,10 +30,10 @@ class SensitivitySettings:
     """Configuration for head tracking sensitivity"""
     x: float = 8.0
     y: float = 8.0
-    acceleration: float = 1.1
-    dead_zone: float = 0.03
-    movement_scale: float = 30.0
-    max_movement: float = 50.0
+    acceleration: float = 1.2
+    dead_zone: float = 0.02
+    movement_scale: float = 40.0
+    max_movement: float = 45.0
 
 class CombatSystem:
     """Handles attack and defense detection"""
@@ -288,12 +288,6 @@ class HeadTracker:
     CHIN_BOTTOM = 152
 
     def __init__(self, smoothing_frames=3, calibration_frames=30):
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            refine_landmarks=True
-        )
         self.sensitivity = SensitivitySettings()
         self.position_history = deque(maxlen=smoothing_frames)
         self.frame_times = deque(maxlen=30)
@@ -302,6 +296,22 @@ class HeadTracker:
         self.CALIBRATION_DURATION = calibration_frames
         self.last_position = None
         self.is_calibrating = False
+        self.kalman_filter = self._init_kalman_filter()
+
+    def _init_kalman_filter(self):
+        """Initialize Kalman filter for smoother nose tracking"""
+        kalman = cv2.KalmanFilter(4, 2)
+        kalman.measurementMatrix = np.array([[1, 0, 0, 0],
+                                       [0, 1, 0, 0]], np.float32)
+        kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+                                      [0, 1, 0, 1],
+                                      [0, 0, 1, 0],
+                                      [0, 0, 0, 1]], np.float32)
+        kalman.processNoiseCov = np.array([[1e-4, 0, 0, 0],
+                                     [0, 1e-4, 0, 0],
+                                     [0, 0, 1e-4, 0],
+                                     [0, 0, 0, 1e-4]], np.float32)
+        return kalman
 
     def recenter_view(self, current_pos):
         """Recenter the view to current head position"""
@@ -309,11 +319,9 @@ class HeadTracker:
         self.last_position = current_pos
         self.position_history.clear()
 
-    def calculate_head_center(self, landmarks):
-        """Calculate the center point between forehead and chin"""
-        forehead = np.array([landmarks[self.FOREHEAD_TOP].x, landmarks[self.FOREHEAD_TOP].y])
-        chin = np.array([landmarks[self.CHIN_BOTTOM].x, landmarks[self.CHIN_BOTTOM].y])
-        return (forehead + chin) / 2
+    def get_nose_position(self, landmarks) -> np.ndarray:
+        """Get nose position from pose landmarks"""
+        return np.array([landmarks[0].x, landmarks[0].y])
 
     def move_camera(self, dx: int, dy: int):
         """Apply camera movement based on head position"""
@@ -323,13 +331,19 @@ class HeadTracker:
             win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(dx), int(dy), 0, 0)
 
     def calculate_relative_movement(self, current_pos):
-        """Calculate relative movement from calibration center"""
+        """Calculate relative movement from calibration center using nose position"""
+        measurement = np.array([[current_pos[0]], [current_pos[1]]], np.float32)
+        prediction = self.kalman_filter.predict()
+        correction = self.kalman_filter.correct(measurement)
+    
+        filtered_pos = correction[:2].flatten()
+    
         if self.last_position is None:
-            self.last_position = current_pos
+            self.last_position = filtered_pos
             return 0, 0
 
-        x_offset = (current_pos[0] - self.calibration_center[0])
-        y_offset = (current_pos[1] - self.calibration_center[1])
+        x_offset = (filtered_pos[0] - self.calibration_center[0])
+        y_offset = (filtered_pos[1] - self.calibration_center[1])
 
         if abs(x_offset) < self.sensitivity.dead_zone:
             x_offset = 0
@@ -342,22 +356,22 @@ class HeadTracker:
         x_movement *= self.sensitivity.x * self.sensitivity.movement_scale
         y_movement *= self.sensitivity.y * self.sensitivity.movement_scale
 
-        self.last_position = current_pos
+        self.last_position = filtered_pos
         return x_movement, y_movement
 
-    def process_landmarks(self, face_landmarks):
-        """Process face landmarks for head tracking"""
-        head_center = self.calculate_head_center(face_landmarks.landmark)
+    def process_landmarks(self, pose_landmarks):
+        """Process pose landmarks for nose tracking"""
+        nose_pos = self.get_nose_position(pose_landmarks.landmark)
 
         if self.calibration_frames < self.CALIBRATION_DURATION or self.is_calibrating:
             if self.calibration_center is None or self.is_calibrating:
-                self.calibration_center = head_center
+                self.calibration_center = nose_pos
                 self.is_calibrating = False
             else:
-                self.calibration_center = self.calibration_center * 0.8 + head_center * 0.2
+                self.calibration_center = self.calibration_center * 0.8 + nose_pos * 0.2
             self.calibration_frames += 1
         else:
-            dx, dy = self.calculate_relative_movement(head_center)
+            dx, dy = self.calculate_relative_movement(nose_pos)
             if dx != 0 or dy != 0:
                 self.move_camera(dx, dy)
 
@@ -374,7 +388,7 @@ class GameController:
         self.mp_drawing = mp.solutions
         self.mp_drawing = mp.solutions.drawing_utils
         
-        self.pose = self.mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.pose = self.mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7, model_complexity=1)
         self.hands = self.mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7, max_num_hands=2)
         
     def process_frame(self, frame):
@@ -383,10 +397,10 @@ class GameController:
         rgb_frame.flags.writeable = False
         frame_height, frame_width = frame.shape[:2]
 
-        # Process head tracking
-        face_results = self.head_tracker.face_mesh.process(rgb_frame)
-        if face_results.multi_face_landmarks:
-            self.head_tracker.process_landmarks(face_results.multi_face_landmarks[0])
+        # Initialize shield_state
+        shield_state = "Down"
+        movement_state = None
+        swing_detected = False
 
         # Process hands for shield detection
         results_hands = self.hands.process(rgb_frame)
@@ -395,32 +409,20 @@ class GameController:
 
         if results_hands.multi_hand_landmarks and results_hands.multi_handedness:
             # First check for both hands raised
-            both_hands_raised = self.combat_system.is_both_hands_raised(
-                results_hands.multi_hand_landmarks, 
-                results_hands.multi_handedness
-            )
-    
+            both_hands_raised = self.combat_system.is_both_hands_raised(results_hands.multi_hand_landmarks, results_hands.multi_handedness)
+
             if both_hands_raised:
                 self.emergency_stop()
                 # Draw both hands in yellow to indicate emergency stop
                 for hand_landmarks in results_hands.multi_hand_landmarks:
-                    self.mp_drawing.draw_landmarks(
-                        frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
-                        self.mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=2),
-                        self.mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=2)
-                    )
+                    self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,self.mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=2),self.mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=2))
             else:
                 # Normal shield detection for single hand
-                for hand_landmarks, handedness in zip(results_hands.multi_hand_landmarks, 
-                                            results_hands.multi_handedness):
+                for hand_landmarks, handedness in zip(results_hands.multi_hand_landmarks, results_hands.multi_handedness):
                     if handedness.classification[0].label == "Right":  # Left hand in mirror
                         current_shield_up = self.combat_system.is_stop_gesture(hand_landmarks.landmark)
                         color = (0, 255, 0) if current_shield_up else (255, 0, 0)
-                        self.mp_drawing.draw_landmarks(
-                            frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
-                            self.mp_drawing.DrawingSpec(color=color, thickness=2),
-                            self.mp_drawing.DrawingSpec(color=color, thickness=2)
-                        )
+                        self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,self.mp_drawing.DrawingSpec(color=color, thickness=2),self.mp_drawing.DrawingSpec(color=color, thickness=2))
 
         # Only process shield state if both hands are not raised
         if not both_hands_raised:
@@ -428,13 +430,16 @@ class GameController:
         else:
             shield_state = "Down"
 
-        # Process pose for movement and attack
+        # Process pose for movement, attack, and nose tracking
         results_pose = self.pose.process(rgb_frame)
         if results_pose.pose_landmarks:
+            # Handle nose tracking for camera movement
+            self.head_tracker.process_landmarks(results_pose.pose_landmarks)
+        
             # Handle movement detection
             movement_state = self.movement_system.detect_movement(
                 frame_width, frame_height, results_pose.pose_landmarks.landmark)
-        
+    
             if movement_state is not None:
                 self.movement_system.map_movement(movement_state)
                 if movement_state != self.movement_system.last_movement and self.movement_system.last_movement is not None:
@@ -444,7 +449,7 @@ class GameController:
             # Handle attack detection
             landmarks = [[lm.x, lm.y, lm.z] for lm in results_pose.pose_landmarks.landmark]
             swing_detected = self.combat_system.detect_swing(landmarks, shield_state)
-            
+        
             # Draw pose landmarks
             self.mp_drawing.draw_landmarks(frame, results_pose.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
@@ -486,7 +491,6 @@ class GameController:
     def cleanup(self):
         """Clean up resources and release all keys"""
         self.movement_system.cleanup()
-        self.head_tracker.face_mesh.close()
         self.pose.close()
         self.hands.close()
 
@@ -504,7 +508,7 @@ def main():
     controller = GameController()
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FPS, controller.config.FPS)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1440)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     
     try:

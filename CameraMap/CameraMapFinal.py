@@ -119,8 +119,8 @@ def main():
 
     tracker = HeadTracker()
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1360)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 786)
 
     try:
         while True:
